@@ -13,8 +13,9 @@
     "https://video.twimg.com/*",
     "https://twitter.com/*",
     "https://x.com/*",
-    "https://www.instagram.com/*",
-    "https://*.cdninstagram.com/*"
+    "https://*.instagram.com/*",
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*"
   ],
   "action": {
     "default_popup": "popup.html",

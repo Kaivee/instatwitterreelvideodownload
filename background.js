@@ -98,15 +98,22 @@ async function fetchSyndicationBestMp4(tweetId) {
 // ─────────────────────────────────────────────────────────────
 async function downloadBlob(videoUrl, pageUrl) {
   let response;
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+    'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+  };
+  try {
+    if (pageUrl) {
+      const u = new URL(pageUrl);
+      headers['Referer'] = u.origin + '/';
+      headers['Origin'] = u.origin;
+    }
+  } catch (_) {}
+
   try {
     response = await fetch(videoUrl, {
       method: 'GET',
-      headers: {
-        'Referer':       'https://x.com/',
-        'Origin':        'https://x.com',
-        'User-Agent':    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
-        'Accept':        'video/mp4,video/*;q=0.9,*/*;q=0.8',
-      },
+      headers,
       credentials: 'include',
     });
   } catch (netErr) {
@@ -167,8 +174,10 @@ function generateFilename(pageUrl) {
     const u = new URL(pageUrl), h = u.hostname.toLowerCase();
     const parts = u.pathname.split('/').filter(Boolean);
     if (h.includes('instagram.com')) {
+      const isStory = u.pathname.includes('/stories/');
       const id = parts[parts.length - 1];
-      prefix = id && id.length > 3 ? `instagram_${id}` : 'instagram_reel';
+      const type = isStory ? 'story' : 'reel';
+      prefix = id && id.length > 3 ? `instagram_${type}_${id}` : `instagram_${type}`;
     } else if (h.includes('twitter.com') || h.includes('x.com')) {
       const si = parts.indexOf('status');
       prefix = si !== -1 && parts[si + 1] ? `x_${parts[si + 1]}` : 'x_video';

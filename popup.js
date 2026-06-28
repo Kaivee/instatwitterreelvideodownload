@@ -66,8 +66,10 @@ function generateFilename(pageUrl) {
     const u = new URL(pageUrl), h = u.hostname.toLowerCase();
     const parts = u.pathname.split('/').filter(Boolean);
     if (h.includes('instagram.com')) {
+      const isStory = u.pathname.includes('/stories/');
       const id = parts[parts.length - 1];
-      prefix = id && id.length > 3 ? `instagram_${id}` : 'instagram_reel';
+      const type = isStory ? 'story' : 'reel';
+      prefix = id && id.length > 3 ? `instagram_${type}_${id}` : `instagram_${type}`;
     } else if (h.includes('twitter.com') || h.includes('x.com')) {
       const si = parts.indexOf('status');
       prefix = si !== -1 && parts[si + 1] ? `x_${parts[si + 1]}` : 'x_video';
@@ -239,26 +241,65 @@ async function scanForVideo() {
   for (const v of videos) {
     let score = 0;
     const r = v.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0)  score += 10;
-    if (!v.paused)                     score += 20;
-    if (v.currentTime > 0)             score += 5;
-    if (r.width * r.height > 40000)    score += 15;
+    
+    // Check if video is within viewport boundaries
+    const inViewport = (
+      r.top < (window.innerHeight || document.documentElement.clientHeight) &&
+      r.bottom > 0 &&
+      r.left < (window.innerWidth || document.documentElement.clientWidth) &&
+      r.right > 0
+    );
+    
+    if (inViewport) {
+      score += 100;
+      // High bonus for being centered in the screen (standard for stories/reels)
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const dx = cx - (window.innerWidth || document.documentElement.clientWidth) / 2;
+      const dy = cy - (window.innerHeight || document.documentElement.clientHeight) / 2;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      score += Math.max(0, 50 - dist / 10);
+    }
+    
+    if (r.width > 0 && r.height > 0) score += 20;
+    if (!v.paused)                   score += 30;
+    if (v.currentTime > 0)           score += 10;
 
     let src = v.src || '';
     if ((!src || src.startsWith('blob:')) && v.querySelector('source')?.src)
       src = v.querySelector('source').src;
-    if (src && !src.startsWith('blob:')) score += 30;
-    else if (src)                        score += 1;
+    if (src && !src.startsWith('blob:')) score += 50;
+    else if (src)                        score += 10;
 
     if (score > bestScore) { bestScore = score; best = { src }; }
   }
 
+  // Fallback to performance entry logs if the best video is a blob URL
   if (!best?.src || best.src.startsWith('blob:')) {
     try {
-      for (const e of [...performance.getEntriesByType('resource')].reverse()) {
-        const n = e.name, p = new URL(n).pathname.toLowerCase();
-        if (!n.startsWith('blob:') && (n.includes('.mp4') || p.includes('/v/') || n.includes('cdninstagram'))) {
-          best = { src: n }; break;
+      const resources = [...performance.getEntriesByType('resource')].reverse();
+      for (const e of resources) {
+        const n = e.name;
+        if (n.startsWith('blob:')) continue;
+        
+        const isMetaCdn = n.includes('cdninstagram') || n.includes('fbcdn');
+        if (!isMetaCdn) continue;
+
+        const isVideo = (
+          n.includes('.mp4') ||
+          n.includes('mime=video') ||
+          n.includes('mime%3Dvideo') ||
+          n.includes('bytestart') ||
+          new URL(n).pathname.toLowerCase().includes('/v/')
+        );
+
+        if (isVideo) {
+          const cleanU = new URL(n);
+          cleanU.searchParams.delete('bytestart');
+          cleanU.searchParams.delete('byteend');
+          cleanU.searchParams.delete('range');
+          best = { src: cleanU.toString() };
+          break;
         }
       }
     } catch (_) {}
@@ -420,18 +461,38 @@ function selectVideoManually() {
       let videoUrl = video.src && !video.src.startsWith('blob:') ? video.src : null;
       if (!videoUrl) {
         try {
-          const entries = performance.getEntriesByType('resource');
-          for (let i = entries.length - 1; i >= 0; i--) {
-            const entry = entries[i];
-            const n = entry.name, p = new URL(n).pathname.toLowerCase();
-            if (!n.startsWith('blob:') && (n.includes('.mp4') || p.includes('/v/') || n.includes('cdninstagram'))) {
-              videoUrl = n; break;
+          const entries = [...performance.getEntriesByType('resource')].reverse();
+          for (const entry of entries) {
+            const n = entry.name;
+            if (n.startsWith('blob:')) continue;
+
+            const isMetaCdn = n.includes('cdninstagram') || n.includes('fbcdn');
+            if (!isMetaCdn) continue;
+
+            const isVideo = (
+              n.includes('.mp4') ||
+              n.includes('mime=video') ||
+              n.includes('mime%3Dvideo') ||
+              n.includes('bytestart') ||
+              new URL(n).pathname.toLowerCase().includes('/v/')
+            );
+
+            if (isVideo) {
+              videoUrl = n;
+              break;
             }
           }
         } catch (_) {}
       }
 
       if (videoUrl) {
+        try {
+          const cleanU = new URL(videoUrl);
+          cleanU.searchParams.delete('bytestart');
+          cleanU.searchParams.delete('byteend');
+          cleanU.searchParams.delete('range');
+          videoUrl = cleanU.toString();
+        } catch (_) {}
         chrome.runtime.sendMessage({ action: 'downloadVideo', videoUrl, pageUrl: location.href });
         showToast('✅  Download started!', '#34d399', 3000);
       } else {
