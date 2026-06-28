@@ -126,8 +126,11 @@ downloadBtn.addEventListener('click', async () => {
         }
       });
     } else {
-      // ── Instagram / other: inject scanner into page ──
-      const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: scanForVideo });
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: scanForVideo,
+        world: 'MAIN'
+      });
 
       if (!result)       { showStatus('error', 'Scanner returned no data.');                       resetButton(); return; }
       if (result.error)  { showStatus(result.privacy ? 'warning' : 'error', result.error);         resetButton(); return; }
@@ -208,11 +211,94 @@ async function scanForVideo() {
     return mp4s.length ? mp4s[0].url : null;
   }
 
+  // Helper to extract unmuted progressive video URLs from Instagram's React Fiber tree
+  function findProgressiveUrlInReact(element) {
+    if (!element) return null;
+
+    function findUrls(obj, seen = new Set()) {
+      if (!obj || typeof obj !== 'object' || seen.has(obj)) return [];
+      seen.add(obj);
+
+      let results = [];
+      if (Array.isArray(obj)) {
+        for (const item of obj) {
+          results = results.concat(findUrls(item, seen));
+        }
+        return results;
+      }
+
+      for (const key of Object.keys(obj)) {
+        let val;
+        try { val = obj[key]; } catch (_) { continue; }
+        
+        if (typeof val === 'string') {
+          if (val.startsWith('http') && (val.includes('fbcdn.net') || val.includes('cdninstagram'))) {
+            results.push({ key, url: val, obj });
+          }
+        } else if (typeof val === 'object' && val !== null) {
+          results = results.concat(findUrls(val, seen));
+        }
+      }
+      return results;
+    }
+
+    const reactUrls = [];
+    let cur = element;
+    for (let i = 0; i < 8 && cur; i++) {
+      for (const key of Object.keys(cur)) {
+        if (key.startsWith('__reactFiber') || key.startsWith('__reactProps')) {
+          reactUrls.push(...findUrls(cur[key]));
+        }
+      }
+      cur = cur.parentElement;
+    }
+
+    let bestUrl = null;
+    let bestScore = -1;
+
+    for (const item of reactUrls) {
+      const { key, url, obj } = item;
+      const urlLow = url.toLowerCase();
+      
+      if (urlLow.includes('.jpg') || urlLow.includes('.jpeg') || urlLow.includes('.png') || urlLow.includes('.webp') || urlLow.includes('mime=image') || key.includes('image')) {
+        continue;
+      }
+      if (urlLow.includes('mime=audio') || key.includes('audio')) {
+        continue;
+      }
+
+      let score = 0;
+      if (key.includes('fallback_progressive') || key.includes('progressive_url') || key.includes('progressive')) {
+        score += 200;
+      }
+      if (urlLow.includes('progressive')) {
+        score += 100;
+      }
+
+      if (obj && typeof obj === 'object') {
+        const vencode = obj.vencode_tag || obj.vencode || '';
+        const vencodeLow = String(vencode).toLowerCase();
+        if (vencodeLow.includes('progressive') || vencodeLow.includes('fallback')) {
+          score += 150;
+        }
+        if (vencodeLow.includes('dash')) {
+          score -= 100;
+        }
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = url;
+      }
+    }
+
+    return bestUrl;
+  }
+
   // ── Twitter / X ────────────────────────────────────────────
   if (hrefLow.includes('twitter.com') || hrefLow.includes('x.com')) {
 
     // 1️⃣ Performance entries — most reliable when video has started playing.
-    //    These are the ACTUAL urls the browser loaded for the current video.
     const perfUrls = getTwitterVideosFromPerf();
     if (perfUrls.length > 0) return { videoUrl: perfUrls[0] };
 
@@ -227,7 +313,6 @@ async function scanForVideo() {
       }
     }
 
-    // Neither worked
     return {
       error: 'No video URL found. ① Make sure the video is playing, then retry. ② Or use "Select video manually" and click directly on the video.',
     };
@@ -237,7 +322,8 @@ async function scanForVideo() {
   const videos = Array.from(document.querySelectorAll('video'));
   if (!videos.length) return { error: 'No video found on this page.' };
 
-  let best = null, bestScore = -1;
+  let bestElement = null;
+  let bestScore = -1;
   for (const v of videos) {
     let score = 0;
     const r = v.getBoundingClientRect();
@@ -265,17 +351,27 @@ async function scanForVideo() {
     if (!v.paused)                   score += 30;
     if (v.currentTime > 0)           score += 10;
 
-    let src = v.src || '';
-    if ((!src || src.startsWith('blob:')) && v.querySelector('source')?.src)
-      src = v.querySelector('source').src;
-    if (src && !src.startsWith('blob:')) score += 50;
-    else if (src)                        score += 10;
-
-    if (score > bestScore) { bestScore = score; best = { src }; }
+    if (score > bestScore) { bestScore = score; bestElement = v; }
   }
 
-  // Fallback to performance entry logs if the best video is a blob URL
-  if (!best?.src || best.src.startsWith('blob:')) {
+  if (!bestElement) return { error: 'No active video found.' };
+
+  // 1️⃣ Try to extract the progressive video URL from the React tree first (with sound)
+  let videoUrl = findProgressiveUrlInReact(bestElement);
+
+  // 2️⃣ If React tree did not yield a progressive URL, try standard DOM source
+  if (!videoUrl) {
+    let src = bestElement.src || '';
+    if ((!src || src.startsWith('blob:')) && bestElement.querySelector('source')?.src) {
+      src = bestElement.querySelector('source').src;
+    }
+    if (src && !src.startsWith('blob:')) {
+      videoUrl = src;
+    }
+  }
+
+  // 3️⃣ Fallback to performance entry logs (filtering out images strictly)
+  if (!videoUrl) {
     try {
       const resources = [...performance.getEntriesByType('resource')].reverse();
       for (const e of resources) {
@@ -284,6 +380,17 @@ async function scanForVideo() {
         
         const isMetaCdn = n.includes('cdninstagram') || n.includes('fbcdn');
         if (!isMetaCdn) continue;
+
+        // Skip image formats completely!
+        const isImage = (
+          n.includes('.jpg') ||
+          n.includes('.jpeg') ||
+          n.includes('.png') ||
+          n.includes('.webp') ||
+          n.includes('mime=image') ||
+          n.includes('mime%3Dimage')
+        );
+        if (isImage) continue;
 
         const isVideo = (
           n.includes('.mp4') ||
@@ -298,17 +405,17 @@ async function scanForVideo() {
           cleanU.searchParams.delete('bytestart');
           cleanU.searchParams.delete('byteend');
           cleanU.searchParams.delete('range');
-          best = { src: cleanU.toString() };
+          videoUrl = cleanU.toString();
           break;
         }
       }
     } catch (_) {}
   }
 
-  if (!best?.src || best.src.startsWith('blob:'))
+  if (!videoUrl || videoUrl.startsWith('blob:'))
     return { error: 'Could not extract a video URL. Play the video fully and try again.' };
 
-  return { videoUrl: best.src };
+  return { videoUrl };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -458,7 +565,96 @@ function selectVideoManually() {
       e.preventDefault(); e.stopImmediatePropagation();
       cleanup();
 
-      let videoUrl = video.src && !video.src.startsWith('blob:') ? video.src : null;
+      // Mark the target element
+      video.setAttribute('data-vs-target', 'true');
+
+      // Inject script to extract progressive url in the MAIN world
+      const script = document.createElement('script');
+      script.textContent = `(() => {
+        const el = document.querySelector('[data-vs-target="true"]');
+        if (!el) return;
+
+        function findUrls(obj, seen = new Set()) {
+          if (!obj || typeof obj !== 'object' || seen.has(obj)) return [];
+          seen.add(obj);
+          let results = [];
+          if (Array.isArray(obj)) {
+            for (const item of obj) results = results.concat(findUrls(item, seen));
+            return results;
+          }
+          for (const key of Object.keys(obj)) {
+            let val;
+            try { val = obj[key]; } catch (_) { continue; }
+            if (typeof val === 'string') {
+              if (val.startsWith('http') && (val.includes('fbcdn.net') || val.includes('cdninstagram'))) {
+                results.push({ key, url: val, obj });
+              }
+            } else if (typeof val === 'object' && val !== null) {
+              results = results.concat(findUrls(val, seen));
+            }
+          }
+          return results;
+        }
+
+        const reactUrls = [];
+        let cur = el;
+        for (let i = 0; i < 8 && cur; i++) {
+          for (const key of Object.keys(cur)) {
+            if (key.startsWith('__reactFiber') || key.startsWith('__reactProps')) {
+              reactUrls.push(...findUrls(cur[key]));
+            }
+          }
+          cur = cur.parentElement;
+        }
+
+        let bestUrl = null;
+        let bestScore = -1;
+        for (const item of reactUrls) {
+          const { key, url, obj } = item;
+          const urlLow = url.toLowerCase();
+          if (urlLow.includes('.jpg') || urlLow.includes('.jpeg') || urlLow.includes('.png') || urlLow.includes('.webp') || urlLow.includes('mime=image') || key.includes('image')) {
+            continue;
+          }
+          if (urlLow.includes('mime=audio') || key.includes('audio')) {
+            continue;
+          }
+          let score = 0;
+          if (key.includes('fallback_progressive') || key.includes('progressive_url') || key.includes('progressive')) {
+            score += 200;
+          }
+          if (urlLow.includes('progressive')) {
+            score += 100;
+          }
+          if (obj && typeof obj === 'object') {
+            const vencode = obj.vencode_tag || obj.vencode || '';
+            const vencodeLow = String(vencode).toLowerCase();
+            if (vencodeLow.includes('progressive') || vencodeLow.includes('fallback')) {
+              score += 150;
+            }
+            if (vencodeLow.includes('dash')) {
+              score -= 100;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestUrl = url;
+          }
+        }
+
+        if (bestUrl) {
+          el.setAttribute('data-vs-url', bestUrl);
+        }
+      })();`;
+
+      document.documentElement.appendChild(script);
+      script.remove();
+
+      let videoUrl = video.getAttribute('data-vs-url') || (video.src && !video.src.startsWith('blob:') ? video.src : null);
+      
+      // Clean up target attributes
+      video.removeAttribute('data-vs-target');
+      video.removeAttribute('data-vs-url');
+
       if (!videoUrl) {
         try {
           const entries = [...performance.getEntriesByType('resource')].reverse();
@@ -469,12 +665,23 @@ function selectVideoManually() {
             const isMetaCdn = n.includes('cdninstagram') || n.includes('fbcdn');
             if (!isMetaCdn) continue;
 
+            // Skip image formats completely!
+            const isImage = (
+              n.includes('.jpg') ||
+              n.includes('.jpeg') ||
+              n.includes('.png') ||
+              n.includes('.webp') ||
+              n.includes('mime=image') ||
+              n.includes('mime%3Dimage')
+            );
+            if (isImage) continue;
+
             const isVideo = (
               n.includes('.mp4') ||
               n.includes('mime=video') ||
               n.includes('mime%3Dvideo') ||
               n.includes('bytestart') ||
-              new URL(n).pathname.toLowerCase().includes('/v/')
+              new URL(n).pathname.toLowerCase().includes('/v/t50.')
             );
 
             if (isVideo) {
