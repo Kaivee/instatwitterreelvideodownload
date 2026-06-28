@@ -97,64 +97,12 @@ async function fetchSyndicationBestMp4(tweetId) {
 // downloadBlob — fetches binary content and downloads via Base64 data URL
 // ─────────────────────────────────────────────────────────────
 async function downloadBlob(videoUrl, pageUrl) {
-  let response;
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
-    'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
-  };
-  try {
-    if (pageUrl) {
-      const u = new URL(pageUrl);
-      headers['Referer'] = u.origin + '/';
-      headers['Origin'] = u.origin;
-    }
-  } catch (_) {}
-
-  try {
-    response = await fetch(videoUrl, {
-      method: 'GET',
-      headers,
-      credentials: 'include',
-    });
-  } catch (netErr) {
-    return { success: false, error: `Network error: ${netErr.message}` };
-  }
-
-  if (!response.ok) {
-    return { success: false, error: `CDN returned status ${response.status}.` };
-  }
-
-  const contentType = response.headers.get('content-type') || 'video/mp4';
-  
-  // Read into an ArrayBuffer
-  let buffer;
-  try {
-    buffer = await response.arrayBuffer();
-  } catch (e) {
-    return { success: false, error: `Failed to read video stream: ${e.message}` };
-  }
-
-  if (!buffer || buffer.byteLength < 1024) {
-    return { success: false, error: 'Downloaded file is empty or too small.' };
-  }
-
-  // Convert ArrayBuffer to Base64 in chunks to avoid stack overflow limits
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  const chunkSize = 8192; // 8KB chunks
-  for (let i = 0; i < len; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  
-  const base64 = btoa(binary);
-  const dataUrl = `data:${contentType};base64,${base64}`;
   const filename = generateFilename(pageUrl);
 
   try {
     const downloadId = await new Promise((resolve, reject) => {
       chrome.downloads.download(
-        { url: dataUrl, filename, saveAs: false, conflictAction: 'uniquify' },
+        { url: videoUrl, filename, saveAs: false, conflictAction: 'uniquify' },
         (id) => chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(id)
       );
     });
